@@ -1,5 +1,5 @@
 import torch.nn as nn
-from .pv_utils import MeanVFE, VoxelBackBone8x, VoxelSetAbstraction, HeightCompression# , BEVCompression , Conv2DCollapse
+from .voxel_backbone import MeanVFE, VoxelBackBone8x, VoxelSetAbstraction, HeightCompression# , BEVCompression , Conv2DCollapse
 # from .data_processor import DataProcessor
 import numpy as np
 

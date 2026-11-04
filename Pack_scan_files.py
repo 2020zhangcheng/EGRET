@@ -1,5 +1,5 @@
 import argparse
-from src.joint_det_dataset import save_data
+from datasets.joint_det_dataset import save_data
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--scannet_data', required=True)

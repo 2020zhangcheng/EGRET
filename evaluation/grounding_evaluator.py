@@ -14,7 +14,7 @@
 
 import torch
 
-from models.losses import _iou3d_par, box_cxcyczwhd_to_xyzxyz
+from models.losses.set_criterion import _iou3d_par, box_cxcyczwhd_to_xyzxyz
 import utils.misc as misc
 import numpy as np
 import wandb

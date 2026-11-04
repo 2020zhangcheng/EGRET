@@ -1,6 +1,6 @@
 import argparse
 from collections import defaultdict
-from src.joint_det_dataset import Joint3DDataset
+from datasets.joint_det_dataset import Joint3DDataset
 
 from functools import partial
 

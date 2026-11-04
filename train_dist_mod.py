@@ -20,9 +20,9 @@ import random
 from main_utils import parse_option, BaseTrainTester
 from data.model_util_scannet import ScannetDatasetConfig
 from models import PVGround
-from src.joint_det_dataset import Joint3DDataset
-from src.grounding_evaluator import GroundingEvaluator
-from models import APCalculator, parse_predictions, parse_groundtruths
+from datasets.joint_det_dataset import Joint3DDataset
+from evaluation.grounding_evaluator import GroundingEvaluator
+from evaluation import APCalculator, parse_predictions, parse_groundtruths
 
 from pcdet.config import cfg_from_yaml_file
 from pcdet.config import cfg as model_cfg

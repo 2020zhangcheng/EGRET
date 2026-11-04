@@ -8,6 +8,7 @@
 # Copyright (c) 2021 Ze Liu. All Rights Reserved.
 # Licensed under the MIT License.
 # ------------------------------------------------------------------------
+"""Seed/box prediction heads: objectness, center, size and semantic scores."""
 
 import numpy as np
 import torch.nn as nn
@@ -47,24 +48,6 @@ class PointsObjClsModule(nn.Module):
         logits = self.conv3(net)  # (batch_size, 1, num_seed)
 
         return logits
-
-
-class PositionEmbeddingLearned(nn.Module):
-    """Absolute pos embedding, learned."""
-
-    def __init__(self, input_channel, num_pos_feats=288):
-        super().__init__()
-        self.position_embedding_head = nn.Sequential(
-            nn.Conv1d(input_channel, num_pos_feats, kernel_size=1),
-            nn.BatchNorm1d(num_pos_feats),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(num_pos_feats, num_pos_feats, kernel_size=1))
-
-    def forward(self, xyz):
-        """Forward pass, xyz is (B, N, 3or6), output (B, F, N)."""
-        xyz = xyz.transpose(1, 2).contiguous()
-        position_embedding = self.position_embedding_head(xyz)
-        return position_embedding
 
 
 class GeneralSamplingModule(nn.Module):

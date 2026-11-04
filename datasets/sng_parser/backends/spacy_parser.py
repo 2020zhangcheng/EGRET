@@ -22,7 +22,7 @@ import json
 
 from tkinter import _flatten
 
-from src.scannet_classes import SCANNET_OBJECTS, UNIQUE_SR3D_OBJECTS, SR3D_OBJECTS, REL_ALIASES, VIEW_DEP_RELS
+from ...scannet_classes import SCANNET_OBJECTS, UNIQUE_SR3D_OBJECTS, SR3D_OBJECTS, REL_ALIASES, VIEW_DEP_RELS
 
 __all__ = ['SpacyParser']
 

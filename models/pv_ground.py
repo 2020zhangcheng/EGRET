@@ -8,111 +8,29 @@
 # Copyright (c) 2021 Ze Liu. All Rights Reserved.
 # Licensed under the MIT License.
 # ------------------------------------------------------------------------
-from .mcln_attention import MultiheadAttention
 import numpy as np
 import math
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from transformers import RobertaModel, RobertaTokenizerFast
-from .backbone_module import Pointnet2Backbone
-from .pv_backbone import pv_backbone
-from .modules import (
+from .backbones.pointnet2_backbone import Pointnet2Backbone
+from .backbones.pv_backbone import pv_backbone
+from .heads.prediction_heads import (
     PointsObjClsModule, GeneralSamplingModule,
-    ClsAgnosticPredictHead, PositionEmbeddingLearned
+    ClsAgnosticPredictHead
 )
-from .encoder_decoder_layers import (
+from .heads.spatial_encoding import (
+    calc_pairwise_locs, PositionEmbeddingLearned
+)
+from .heads.query_generation import GumbelSampling
+from .heads.text_decoder import SWA, FFN
+from .heads.transformer_layers import (
     BiEncoder, BiEncoderLayer, BiDecoderLayer
 )
 from utils.scatter_util import scatter_mean
 import pointnet2_utils
 import einops
-def calc_pairwise_locs(obj_centers,  eps=1e-10):
-
-    pairwise_locs = einops.repeat(obj_centers, 'b l d -> b l 1 d') \
-        - einops.repeat(obj_centers, 'b l d -> b 1 l d')
-    pairwise_dists = torch.sqrt(torch.sum(pairwise_locs**2, 3) + eps) # (b, l, l)
-    norm_pairwise_dists = pairwise_dists
-
-    pairwise_dists_2d = torch.sqrt(torch.sum(pairwise_locs[..., :2]**2, 3)+eps)
-
-    pairwise_locs = torch.stack(
-        [norm_pairwise_dists, pairwise_locs[..., 2]/pairwise_dists, 
-        pairwise_dists_2d/pairwise_dists, pairwise_locs[..., 1]/pairwise_dists_2d,
-        pairwise_locs[..., 0]/pairwise_dists_2d],
-        dim=3
-    )
-    return pairwise_locs
-
-
-class SWA(nn.Module):
-
-    def __init__(self, d_model=256, nhead=8, dropout=0.0):
-        super().__init__()
-        self.attn = MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-        self._reset_parameters()
-        self.nhead = nhead
-
-    def _reset_parameters(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-
-    def with_pos_embed(self, tensor, pos):
-        return tensor if pos is None else tensor + pos
-
-    def forward(self, source, query, attn_mask=None, pe=None):
-        """
-        source (B, N_p, d_model)
-        batch_offsets Tensor (b, n_p)
-        query Tensor (b, n_q, d_model)
-        attn_masks Tensor (b, n_q, n_p)
-        """
-        
-        query = self.with_pos_embed(query, pe)
-        B = query.shape[1]
-        k = v = source
-        if attn_mask is not None:
-            attn_mask = attn_mask.unsqueeze(1).repeat(1, self.nhead, 1, 1).view(B*self.nhead, query.shape[0], k.shape[0])
-            output, output_weight, src_weight = self.attn(query, k, v, key_padding_mask=None,attn_mask=attn_mask)  # (1, 100, d_model)
-        else:
-            output, output_weight, src_weight = self.attn(query, k, v)
-        self.dropout(output)
-        output = output + query
-        self.norm(output)
-
-        return output.transpose(0,1), output_weight, src_weight # (b, n_q, d_model), (b, n_q, n_v)
-
-class FFN(nn.Module):
-
-    def __init__(self, d_model, hidden_dim, dropout=0.0, activation_fn='relu'):
-        super().__init__()
-        if activation_fn == 'relu':
-            self.net = nn.Sequential(
-                nn.Linear(d_model, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, d_model),
-                nn.Dropout(dropout),
-            )
-        elif activation_fn == 'gelu':
-            self.net = nn.Sequential(
-                nn.Linear(d_model, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, d_model),
-                nn.Dropout(dropout),
-            )
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, x):
-        output = self.net(x)
-        output = output + x
-        output = self.norm(output)
-        return output
-
 
 
 class PVGround(nn.Module):
@@ -546,32 +464,3 @@ class PVGround(nn.Module):
         for m in self.modules():
             if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
                 m.momentum = 0.1
-
-
-class GumbelSampling(nn.Module):
-    def __init__(self, in_features, sampling_n, dropout=0.1, activation_fn=None):
-        super(GumbelSampling, self).__init__()
-        self.attn = nn.MultiheadAttention(
-            embed_dim=in_features, 
-            num_heads=8, 
-            batch_first=True
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(in_features)
-        self.sampler = nn.Linear(in_features, sampling_n)
-        
-    def forward(self, x, tau=1., hard=False, mask=None):
-        """
-        x.shape = [bz, point_num, feature_len]
-        """
-
-        x_attn = self.attn(x, x, x)[0]
-        x = x + self.dropout(x_attn)
-        x = self.norm(x)
-
-        sample_weights = self.sampler(x) # [bz, N, sampling_n]
-
-        batch_size, num_points, sampling_n = sample_weights.shape
-        attn = F.gumbel_softmax(sample_weights.transpose(1, 2).contiguous().reshape(-1, num_points), tau=tau, hard=hard)
-        attn = attn.reshape(batch_size, sampling_n, num_points)
-        return attn  # [batch_size, sampling_n, num_points]
