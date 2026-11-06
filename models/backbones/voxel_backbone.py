@@ -515,26 +515,24 @@ class VoxelSetAbstraction(nn.Module):
         )
         return pooled_features
 
-    def forward(self, batch_dict):
-        """
+    def aggregate_point_features(self, batch_dict, keypoints):
+        """Gather the fused VSA features at arbitrary xyz locations.
+
+        This is the *reusable* core of :meth:`forward`: it takes an explicit set
+        of query points instead of running FPS itself, so the exact same
+        ``SA_layers`` / ``vsa_point_feature_fusion`` weights are shared between
+        the 1024 FPS seeds and any additional (e.g. ROI) point set.
+
         Args:
-            batch_dict:
-                batch_size:
-                keypoints: (B, num_keypoints, 3)
-                multi_scale_3d_features: {
-                        'x_conv4': ...
-                    }
-                points: optional (N, 1 + 3 + C) [bs_idx, x, y, z, ...]
-                spatial_features: optional
-                spatial_features_stride: optional
+            batch_dict: output of the voxel backbone (needs ``spatial_features``,
+                ``multi_scale_3d_features``, ``points`` and ``batch_size``).
+            keypoints: ``(N, 4)`` tensor ``[bs_idx, x, y, z]``, grouped by
+                ``bs_idx`` in ascending order (as produced by
+                :meth:`get_sampled_points`).
 
         Returns:
-            point_features: (N, C)
-            point_coords: (N, 4)
-
+            ``(N, self.n_output_features)``
         """
-        keypoints = self.get_sampled_points(batch_dict)
-
         point_features_list = []
         if 'bev' in self.model_cfg.FEATURES_SOURCE:
             point_bev_features = self.interpolate_from_bev_features(
@@ -542,7 +540,6 @@ class VoxelSetAbstraction(nn.Module):
                 bev_stride=batch_dict['spatial_features_stride']
             )
             point_features_list.append(point_bev_features)
-            # print(f'point_bev_features shape: {point_bev_features.shape}')
 
         batch_size = batch_dict['batch_size']
 
@@ -565,8 +562,6 @@ class VoxelSetAbstraction(nn.Module):
                 rois=batch_dict.get('rois', None)
             )
             point_features_list.append(pooled_features)
-            # print(pooled_features.shape)
-            # print(f'pooled shape: {pooled_features.shape}')
 
         for k, src_name in enumerate(self.SA_layer_names):
             cur_coords = batch_dict['multi_scale_3d_features'][src_name].indices
@@ -587,13 +582,59 @@ class VoxelSetAbstraction(nn.Module):
             )
 
             point_features_list.append(pooled_features)
-            # print(f'pooled shape: {pooled_features.shape}')
 
         point_features = torch.cat(point_features_list, dim=-1)
-        # print(f'point_features shape: {point_features.shape}')
+        point_features = self.vsa_point_feature_fusion(
+            point_features.view(-1, point_features.shape[-1]))
+        return point_features
 
-        # batch_dict['point_features_before_fusion'] = point_features.view(-1, point_features.shape[-1])
-        point_features = self.vsa_point_feature_fusion(point_features.view(-1, point_features.shape[-1]))
+    def extract_point_features(self, batch_dict, point_xyz):
+        """Feature gathering for an arbitrary ``(B, S, 3)`` point set.
+
+        Reuses :meth:`aggregate_point_features`, i.e. the *same* voxel/BEV/raw
+        point branches and the *same* fusion layer as the 1024 seeds.  The
+        number of points ``S`` may differ from ``self.n_keypoints``.
+
+        Returns:
+            ``(B, S, self.n_output_features)``
+        """
+        if point_xyz.dim() != 3 or point_xyz.shape[-1] != 3:
+            raise ValueError(f'point_xyz must be (B, S, 3), got {tuple(point_xyz.shape)}')
+        batch_size, num_points = point_xyz.shape[0], point_xyz.shape[1]
+        if batch_size != batch_dict['batch_size']:
+            raise ValueError(
+                f'batch mismatch: point_xyz has {batch_size}, '
+                f'batch_dict has {batch_dict["batch_size"]}')
+        if num_points < 1:
+            raise ValueError('point_xyz must contain at least one point per batch item')
+
+        bs_idx = torch.arange(batch_size, device=point_xyz.device, dtype=point_xyz.dtype)
+        bs_idx = bs_idx.view(batch_size, 1, 1).expand(batch_size, num_points, 1)
+        keypoints = torch.cat([bs_idx, point_xyz.to(bs_idx.dtype)], dim=2).reshape(-1, 4).contiguous()
+
+        features = self.aggregate_point_features(batch_dict, keypoints)
+        return features.view(batch_size, num_points, -1)
+
+    def forward(self, batch_dict):
+        """
+        Args:
+            batch_dict:
+                batch_size:
+                keypoints: (B, num_keypoints, 3)
+                multi_scale_3d_features: {
+                        'x_conv4': ...
+                    }
+                points: optional (N, 1 + 3 + C) [bs_idx, x, y, z, ...]
+                spatial_features: optional
+                spatial_features_stride: optional
+
+        Returns:
+            point_features: (N, C)
+            point_coords: (N, 4)
+
+        """
+        keypoints = self.get_sampled_points(batch_dict)
+        point_features = self.aggregate_point_features(batch_dict, keypoints)
 
         batch_dict['point_features'] = point_features.view(batch_dict['batch_size'], self.n_keypoints, self.n_output_features)  # (B, N, C)
         batch_dict['point_coords'] = keypoints[:, 1:4].view(batch_dict['batch_size'], self.n_keypoints, 3)  # (B, N, 3)

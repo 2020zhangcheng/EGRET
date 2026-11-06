@@ -19,7 +19,7 @@ import random
 
 from main_utils import parse_option, BaseTrainTester
 from data.model_util_scannet import ScannetDatasetConfig
-from models import PVGround
+from models import PVGround, apply_lora, mark_only_lora_trainable
 from datasets.joint_det_dataset import Joint3DDataset
 from evaluation.grounding_evaluator import GroundingEvaluator
 from evaluation import APCalculator, parse_predictions, parse_groundtruths
@@ -106,6 +106,21 @@ class TrainTester(BaseTrainTester):
             num_class = 256
         else:
             num_class = 19
+
+        # entropy-gradient guided ROI fusion (off by default -> original model)
+        roi_cfg = None
+        if getattr(args, 'roi', False):
+            roi_cfg = {
+                'enabled': True,
+                'num_points': args.roi_points,
+                'topk': args.roi_topk,
+                'radius': args.roi_radius,
+                'max_radius': args.roi_max_radius,
+                'expand_factor': args.roi_expand_factor,
+                'tau': args.roi_tau,
+                'log_interval': args.roi_log_interval,
+            }
+
         ModelClass = eval(args.model)
         model = ModelClass(
             self.model_cfg,
@@ -119,10 +134,19 @@ class TrainTester(BaseTrainTester):
             butd=args.butd or args.butd_gt or args.butd_cls,
             pointnet_ckpt=args.pp_checkpoint,
             data_path = args.data_root,
-            self_attend=args.self_attend
+            self_attend=args.self_attend,
+            roi=roi_cfg
         )
-        # params =  sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
-        # print(f'Total parameters: {params:.2f}M')
+        params = sum(p.numel() for p in model.parameters()) / 1e6
+        print(f'Total parameters: {params:.2f}M')
+
+        # LoRA fine-tuning: freeze the pretrained model, adapt only LoRA params
+        if getattr(args, 'lora', False):
+            apply_lora(model, r=args.lora_rank, alpha=args.lora_alpha,
+                       dropout=args.lora_dropout)
+            n_train, n_total = mark_only_lora_trainable(model)
+            print(f'[lora] trainable {n_train / 1e6:.3f}M / '
+                  f'{n_total / 1e6:.2f}M parameters')
         return model
 
     # BRIEF input data.
@@ -166,6 +190,8 @@ class TrainTester(BaseTrainTester):
             "det_bbox_label_mask": batch_data['all_detected_bbox_label_mask'],  # ([B, 132]) mask
             "det_class_ids": batch_data['all_detected_class_ids'],   # ([B, 132])  box id
             "superpoint": batch_data['superpoint'],  # ([B, 50000]) superpoint map
+            # ([B, 132, 256]) phrase-token map, only used by the ROI ranking
+            "positive_map": batch_data.get('positive_map', None),
         }
 
 
