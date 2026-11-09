@@ -15,12 +15,13 @@ TORCH_DISTRIBUTED_DEBUG=INFO CUDA_VISIBLE_DEVICES=0,1 python -m torch.distribute
     --model PVGround \
     --eval \
     --checkpoint_path ./data/PV-Ground_ScanRefer_single.pth \
+    ${EXTRA_ARGS}
 
 
-# Evaluate a LoRA-finetuned checkpoint (appended args win, so the checkpoint and
-# the model switches are overridden):
+# Evaluate a fine-tuned checkpoint / the ROI variant (appended args win, so the
+# checkpoint and the model switches are overridden):
 #   CUDA_VISIBLE_DEVICES=0,1,2 NGPU=3 \
 #   EXTRA_ARGS="--checkpoint_path ./logs/scanrefer/<exp>/<ts>/ckpt_epoch_10.pth \
-#               --lora --roi --max_epoch 10 --data_root ./data/ --batch_size 8" \
+#               --roi --roi_selector field --roi_points 256 --roi_radius_max 2.0 \
+#               --data_root ./data/ --batch_size 8" \
 #   bash tools/test_scanrefer_single.sh
-tools/__pycache__

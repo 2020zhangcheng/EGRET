@@ -25,9 +25,7 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
-from models import (
-    HungarianMatcher, SetCriterion, compute_hungarian_loss, lora_state_dict,
-)
+from models import HungarianMatcher, SetCriterion, compute_hungarian_loss
 from utils import get_scheduler, setup_logger
 
 from utils import record_tensorboard
@@ -110,18 +108,39 @@ def parse_option():
     parser.add_argument('--roi_radius', type=float, default=0.3,
                         help='ball radius (m) of the ROI union')
     parser.add_argument('--roi_max_radius', type=float, default=2.0)
-    parser.add_argument('--roi_expand_factor', type=float, default=1.5)
     parser.add_argument('--roi_tau', type=float, default=0.0,
                         help='softmax temperature over the queries (0 = auto)')
-    parser.add_argument('--roi_log_interval', type=int, default=200,
-                        help='print ROI statistics every N forward passes (0 = off)')
 
-    # LoRA fine-tuning
-    parser.add_argument('--lora', action='store_true',
-                        help='freeze the pretrained model and train LoRA adapters only')
-    parser.add_argument('--lora_rank', type=int, default=8)
-    parser.add_argument('--lora_alpha', type=float, default=16.0)
-    parser.add_argument('--lora_dropout', type=float, default=0.0)
+    # ---- ROI ranking rule --------------------------------------------------
+    # field        : box-proposal field -> robust single ball   (recommended)
+    # entropy_ball : entropy-gradient norm -> robust single ball
+    # entropy      : Top-K entropy gradient -> union of K balls  (ablation /
+    #                visualisation only)
+    # fuse_mul / fuse_min / fuse_gate : field fused with the entropy-gradient
+    #                ranking (product / AND-gate / soft gate)
+    parser.add_argument('--roi_selector', type=str, default='field',
+                        choices=['field', 'entropy_ball', 'entropy',
+                                 'fuse_mul', 'fuse_min', 'fuse_gate'],
+                        help='ROI ranking rule (baseline = do not pass --roi)')
+    parser.add_argument('--roi_k_min', type=int, default=4,
+                        help='minimum number of reliable seeds kept')
+    parser.add_argument('--roi_nms_radius', type=float, default=0.5,
+                        help='min separation (m) between two reliable seeds')
+    parser.add_argument('--roi_mass_frac', type=float, default=0.9,
+                        help='stop selecting seeds after this fraction of the mass')
+    parser.add_argument('--roi_score_ratio', type=float, default=0.3,
+                        help='relative score threshold w.r.t. the maximum')
+    parser.add_argument('--roi_radius_q', type=float, default=0.9,
+                        help='weighted quantile of the seed distances = support')
+    parser.add_argument('--roi_radius_margin', type=float, default=0.35,
+                        help='margin (m) added to the adaptive radius')
+    parser.add_argument('--roi_radius_min', type=float, default=0.4)
+    parser.add_argument('--roi_radius_max', type=float, default=2.0)
+    parser.add_argument('--roi_topm', type=int, default=4,
+                        help='number of box hypotheses fused into the proposal field')
+    parser.add_argument('--roi_fuse_alpha', type=float, default=1.0,
+                        help='strength of the entropy-gradient modulation in '
+                             '--roi_selector fuse_gate (0 = field only)')
 
     # AMP / gradient accumulation / resume
     parser.add_argument('--amp', action='store_true', help='automatic mixed precision')
@@ -129,9 +148,6 @@ def parse_option():
                         help='gradient accumulation steps (effective batch x accum_steps)')
     parser.add_argument('--resume', action='store_true',
                         help='restore epoch / optimizer / scheduler from --checkpoint_path')
-    parser.add_argument('--init_checkpoint', default=None,
-                        help='pretrained weights used when --checkpoint_path is a '
-                             'LoRA-only checkpoint (default: data/PV-Ground_ScanRefer_single.pth)')
 
     # io
     parser.add_argument('--checkpoint_path', default=None,
@@ -188,29 +204,12 @@ def _load_state_dict(args, model, state_dict, tag=''):
 def load_checkpoint(args, model, optimizer, scheduler):
     """Load from checkpoint.
 
-    Supports both
-
-    * a *full* checkpoint (``data/PV-Ground_ScanRefer_single.pth``), and
-    * a *LoRA-only* checkpoint written by :func:`save_checkpoint` when
-      ``--lora`` is used (``{'lora_only': True}``); in that case the frozen
-      pretrained weights are restored first from ``--init_checkpoint``.
-
     ``--resume`` additionally restores ``epoch``/``optimizer``/``scheduler``.
     """
     print("=> loading checkpoint '{}'".format(args.checkpoint_path))
     checkpoint = torch.load(args.checkpoint_path, map_location='cpu', weights_only=False)
 
     state = checkpoint['model']
-    if checkpoint.get('lora_only', False):
-        init_ckpt = getattr(args, 'init_checkpoint', None) or \
-            'data/PV-Ground_ScanRefer_single.pth'
-        print(f"=> LoRA-only checkpoint detected, restoring the frozen base "
-              f"weights from '{init_ckpt}'")
-        base = torch.load(init_ckpt, map_location='cpu', weights_only=False)
-        model.load_state_dict(base['model'], strict=False)
-        del base
-        torch.cuda.empty_cache()
-
     _load_state_dict(args, model, state, tag='')
 
     if getattr(args, 'resume', False) and not args.eval:
@@ -239,28 +238,15 @@ def load_checkpoint(args, model, optimizer, scheduler):
 
 # BRIEF save model.
 def save_checkpoint(args, epoch, model, optimizer, scheduler, save_cur=False):
-    """Save checkpoint if requested.
-
-    With ``--lora`` only the freshly trained parameters (LoRA adapters + the new
-    ROI fusion parameter) are stored, so the pretrained weights on disk are
-    never duplicated nor overwritten.
-    """
+    """Save checkpoint if requested."""
     if save_cur or epoch % args.save_freq == 0:
-        if getattr(args, 'lora', False):
-            state_dict = lora_state_dict(model)
-            lora_only = True
-        else:
-            state_dict = model.state_dict()
-            lora_only = False
-
         state = {
             'config': args,
             'save_path': '',
-            'model': state_dict,
+            'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict() if scheduler is not None else None,
             'epoch': epoch,
-            'lora_only': lora_only,
         }
 
         spath = os.path.join(args.log_dir, f'ckpt_epoch_{epoch}.pth')
@@ -382,31 +368,7 @@ class BaseTrainTester:
     @staticmethod
     def get_optimizer(args, model):
         """Initialize optimizer."""
-        if getattr(args, 'lora', False):
-            # Two groups are kept so that the logging code (param_groups[1])
-            # keeps working: LoRA / new fusion params first, then dummies.
-            lora_params = [p for n, p in model.named_parameters()
-                           if 'lora_' in n and p.requires_grad]
-            extra_params = [p for n, p in model.named_parameters()
-                            if 'lora_' not in n and p.requires_grad]
-            print(f'[lora] optimizer: {len(lora_params)} LoRA tensors, '
-                  f'{len(extra_params)} extra tensors')
-            param_dicts = [
-                {
-                    "params": lora_params + extra_params,
-                    "lr": args.lr,
-                    "weight_decay": 0.0,
-                },
-                {
-                    "params": [],
-                    "lr": args.lr_backbone,
-                },
-                {
-                    "params": [],
-                    "lr": args.text_encoder_lr,
-                }
-            ]
-        elif args.frozen:
+        if args.frozen:
             print("-------------------------------frozen backbone parameters------------------------------------")
             for n, p in model.named_parameters():
                 if "backbone_net" in n or "text_encoder" in n:
@@ -650,8 +612,7 @@ class BaseTrainTester:
         Run a single epoch.
 
         Supports automatic mixed precision (``--amp``, ``scaler``) and gradient
-        accumulation (``--accum_steps``).  With ``--lora`` the frozen
-        parameters are never touched by the optimizer.
+        accumulation (``--accum_steps``).
 
         Some of the args:
             model: a nn.Module that returns end_points (dict)

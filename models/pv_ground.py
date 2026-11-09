@@ -84,19 +84,35 @@ class PVGround(nn.Module):
         self.roi_cfg = dict(roi) if roi else None
         self.roi_enabled = bool(self.roi_cfg and self.roi_cfg.get('enabled', True))
         if self.roi_enabled:
-            self.roi_num_points = int(self.roi_cfg.get('num_points', 512))
+            self.roi_num_points = int(self.roi_cfg.get('num_points', 256))
             self.roi_topk = int(self.roi_cfg.get('topk', 32))
-            self.roi_radius = float(self.roi_cfg.get('radius', 0.3))
+            self.roi_radius = float(self.roi_cfg.get('radius', 0.4))
             self.roi_max_radius = float(self.roi_cfg.get('max_radius', 2.0))
-            self.roi_expand_factor = float(self.roi_cfg.get('expand_factor', 1.5))
             self.roi_tau = float(self.roi_cfg.get('tau', 0.0))
-            self.roi_log_interval = int(self.roi_cfg.get('log_interval', 200))
-            self.roi_num_class = num_class
+            # ROI ranking / geometry:
+            #   'field'        box-proposal field  -> robust single ball (default)
+            #   'entropy_ball' entropy-gradient    -> robust single ball
+            #   'entropy'      Top-K entropy grad  -> union of K balls (legacy,
+            #                  kept for the visualisation / ablation only)
+            self.roi_selector = str(self.roi_cfg.get('selector', 'field'))
+            self.roi_k_min = int(self.roi_cfg.get('k_min', 4))
+            self.roi_nms_radius = float(self.roi_cfg.get('nms_radius', 0.5))
+            self.roi_mass_frac = float(self.roi_cfg.get('mass_frac', 0.9))
+            self.roi_score_ratio = float(self.roi_cfg.get('score_ratio', 0.3))
+            self.roi_radius_q = float(self.roi_cfg.get('radius_q', 0.9))
+            self.roi_radius_margin = float(self.roi_cfg.get('radius_margin', 0.35))
+            self.roi_radius_min = float(self.roi_cfg.get('radius_min', 0.4))
+            self.roi_radius_max = float(self.roi_cfg.get('radius_max', 2.0))
+            self.roi_topm = int(self.roi_cfg.get('topm', 4))
+            # strength of the entropy-gradient modulation used by fuse_gate:
+            #   R = rank(f) * (1 + alpha * rank(s)) / (1 + alpha)
+            # alpha = 0 -> field only, larger -> the competition-sensitive seeds
+            # inside the box region get relatively more weight.
+            self.roi_fuse_alpha = float(self.roi_cfg.get('fuse_alpha', 1.0))
             # A single learned type vector separating ROI points from seeds.
             # Zero-initialised -> no behaviour change at initialisation, fully
-            # trainable afterwards (it is the only *new* parameter besides LoRA).
+            # trainable afterwards (it is the only *new* parameter).
             self.roi_type_embedding = nn.Parameter(torch.zeros(d_model))
-            self._roi_calls = 0
 #-------------------text-head decoder-------------------------------------
         self.out_norm = nn.LayerNorm(d_model)
         self.out_score = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, 1))
@@ -432,25 +448,50 @@ class PVGround(nn.Module):
     # ------------------------------------------------------------------ #
     def _selection_entropy_seed_score(self, points_xyz, seed_features_cn,
                                       text_feats, text_padding_mask, positive_map,
-                                      detected_feats=None, detected_mask=None):
-        """``s_i = ||dH_sel/dF_i||_2`` for the 1024 seeds -> ``(B, N)``.
+                                      detected_feats=None, detected_mask=None,
+                                      need_grad=True):
+        """One ranking pass -> entropy gradient and everything it can give.
 
-        The definition lives in ``utils/entropy_gradient.py``.  Only the
-        *decoder* part is differentiated: the visual features are made a
-        detached leaf, so no gradient leaks into the parameters and the graph is
-        released right after the single ``autograd.grad`` call.
+        ``s_i = ||dH_sel/dF_i||_2`` (the definition lives in
+        ``utils/entropy_gradient.py``).  Only the *decoder* part is
+        differentiated: the visual features are made a detached leaf, so no
+        gradient leaks into the parameters and the graph is released right
+        after the single ``autograd.grad`` call.
+
+        The same pass is reused for additional, *free* signals (no extra
+        forward):
+
+        * ``sel_prob`` ``(B, Q)``: ``P(q|m)``, the query that owns the referred
+          instance -> its feature ``query_feat`` is the model's own target
+          hypothesis ``q*``;
+        * ``pred_center`` / ``pred_size`` ``(B, Q, 3)``: the regressed boxes;
+        * ``query_feat`` ``(B, C)``: used for the text-conditioned seed mask.
+
+        Args:
+            need_grad: when False the pass runs under ``no_grad`` and the
+                backward through the decoder is skipped (``score``/``grad`` are
+                then ``None``).  The ``field`` / ``proposal*`` selectors do not
+                use the gradient, so they take this cheaper path; the results
+                are identical because nothing else depends on it.
+
+        Returns:
+            dict with ``score`` ``(B, N)`` (or None), ``grad`` ``(B, N, C)``
+            (or None), ``sel_prob`` ``(B, Q)``, ``query_feat`` ``(B, C)``.
         """
         from utils import entropy_gradient as eg
 
         rank_end_points = {}
         was_training = self.training
-        with torch.enable_grad(), torch.amp.autocast('cuda', enabled=False):
-            leaf = seed_features_cn.detach().float().requires_grad_(True)   # (B, C, N)
+        ctx = torch.enable_grad() if need_grad else torch.no_grad()
+        with ctx, torch.amp.autocast('cuda', enabled=False):
+            leaf = seed_features_cn.detach().float()
+            if need_grad:
+                leaf.requires_grad_(True)                          # (B, C, N)
             try:
                 if was_training:
                     # deterministic ranking pass: running BN stats, no dropout
                     self.eval()
-                self._queries_and_boxes(
+                _, query_last, _ = self._queries_and_boxes(
                     points_xyz, leaf, text_feats.detach().float(), text_padding_mask,
                     rank_end_points,
                     detected_feats=None if detected_feats is None else detected_feats.detach(),
@@ -459,67 +500,193 @@ class PVGround(nn.Module):
                 if was_training:
                     self.train()
 
-            if 'last_sem_cls_scores' not in rank_end_points:
-                raise RuntimeError('the ranking pass did not produce last_sem_cls_scores')
+            grad, score, prob_qm, entropy = None, None, None, None
+            if need_grad:
+                if 'last_sem_cls_scores' not in rank_end_points:
+                    raise RuntimeError(
+                        'the ranking pass did not produce last_sem_cls_scores')
+                sem_prob = torch.softmax(
+                    rank_end_points['last_sem_cls_scores'].float(), dim=-1)
+                score_qm = eg.selection_scores(sem_prob, positive_map)  # (B, Q, M)
+                tau = eg.resolve_tau(score_qm, self.roi_tau)
+                prob_qm = torch.softmax(score_qm / tau, dim=1)          # (B, Q, M)
+                entropy = eg.selection_entropy_scalar(prob_qm, reduce='sum')
+                grad, = torch.autograd.grad(entropy, leaf, allow_unused=False)
+                # (B, C, N) -> (B, N, C): the *full* gradient is kept, its
+                # direction carries the signed reliability signal.
+                grad = grad.detach().transpose(1, 2).contiguous().float()
+                score = grad.double().norm(dim=-1).float()              # (B, N)
+                if score.shape != points_xyz.shape[:2]:
+                    raise RuntimeError(
+                        f'seed score/xyz mismatch: {tuple(score.shape)} vs '
+                        f'{tuple(points_xyz.shape[:2])}')
 
-            sem_prob = torch.softmax(rank_end_points['last_sem_cls_scores'].float(), dim=-1)
-            score_qm = eg.selection_scores(sem_prob, positive_map)      # (B, Q, M)
-            tau = eg.resolve_tau(score_qm, self.roi_tau)
-            prob_qm = torch.softmax(score_qm / tau, dim=1)              # (B, Q, M)
-            entropy = eg.selection_entropy_scalar(prob_qm, reduce='sum')
-            grad, = torch.autograd.grad(entropy, leaf, allow_unused=False)
+        if 'last_center' not in rank_end_points or 'last_pred_size' not in rank_end_points:
+            raise RuntimeError('the ranking pass did not produce last_center/last_pred_size')
 
-        score = grad.detach().double().norm(dim=1).float()              # (B, N)
-        if score.shape != points_xyz.shape[:2]:
-            raise RuntimeError(
-                f'seed score/xyz mismatch: {tuple(score.shape)} vs '
-                f'{tuple(points_xyz.shape[:2])}')
-        return score
+        sel_prob = self._query_selection(
+            rank_end_points.get('last_proj_queries'),
+            text_feats.detach().float(), text_padding_mask, positive_map)
+        return {
+            'score': score,                # (B, N) or None (no-grad selectors)
+            'grad': grad,                  # (B, N, C) or None
+            'sel_prob': sel_prob,          # (B, Q) P(q|m), evaluator criterion
+            'pred_center': rank_end_points['last_center'].detach().float(),
+            'pred_size': rank_end_points['last_pred_size'].detach().float(),
+        }
+
+    def _query_selection(self, proj_queries, text_feats, text_padding_mask,
+                         positive_map):
+        """``P(q|m)`` with the *same* criterion the evaluator uses.
+
+        ``evaluate_one_epoch`` scores a decoder query by the cosine similarity
+        between its contrastive projection (``proj_queries``, 64-d) and the
+        *phrase tokens* of the text, divided by ``0.07``.  Using the soft-token
+        classification head instead (``last_sem_cls_scores``) gives a query
+        ranking that is **not** the one used for the prediction, which is why
+        the arg-max box of the head distribution is a bad ROI prior (measured:
+        IoU 0.00 / 2.9 m centre error on 200 val samples, versus 0.36 / 0.55 m
+        with this criterion).  Returns the softmax over the queries with the
+        usual auto temperature.
+
+        Args:
+            proj_queries: ``(B, Q, 64)`` normalised query projections or None.
+            text_feats: ``(B, L, C)`` text memory of the ranking pass.
+            text_padding_mask: ``(B, L)`` bool (True = padded).
+            positive_map: ``(B, 1, 256)`` phrase-token span or None.
+
+        Returns:
+            ``prob`` ``(B, Q)``.
+        """
+        if proj_queries is None:          # contrastive loss disabled -> uniform
+            prob = torch.full(proj_queries.shape[:2], 1.0 / proj_queries.size(1),
+                              device=text_feats.device)
+            return prob
+
+        proj_tokens = F.normalize(
+            self.contrastive_align_projection_text(text_feats), p=2, dim=-1)
+        sim = torch.einsum('bqc,blc->bql', proj_queries.float(), proj_tokens) / 0.07
+
+        L = sim.size(-1)
+        valid = ~text_padding_mask.bool()
+        if positive_map is not None:
+            pm = torch.as_tensor(np.asarray(positive_map), dtype=torch.float32,
+                                 device=sim.device)
+            pm = pm.reshape(pm.shape[0], -1)[:, :L]
+            if pm.size(1) < L:
+                pm = torch.cat([pm, pm.new_zeros(pm.size(0), L - pm.size(1))], 1)
+            phrase = pm > 0
+            # a sample without a usable span falls back to the whole utterance
+            phrase = torch.where(phrase.any(dim=1, keepdim=True), phrase,
+                                 torch.ones_like(phrase))
+            valid = valid & phrase
+        valid = valid.clone()
+        valid[~valid.any(dim=1)] = True   # never mask everything
+
+        affinity = sim.masked_fill(~valid.unsqueeze(1), -1e4).max(dim=-1).values
+        tau = affinity.detach().std(dim=1, keepdim=True).clamp_min(1e-4)
+        return torch.softmax(affinity / tau, dim=1)                     # (B, Q)
 
     def _sample_roi_region(self, points_xyz, seed_features_cn, cloud_xyz,
                            text_feats, text_padding_mask, positive_map,
                            detected_feats=None, detected_mask=None):
-        """Top-K entropy-gradient seeds -> union of balls -> FPS 512 points."""
-        score = self._selection_entropy_seed_score(
+        """ROI -> FPS points, appended to the 1024 seeds.
+
+        Three rankings are supported:
+
+        * ``field`` (default): the box-proposal field ``f_i`` of the model's own
+          predicted boxes -> robust single ball;
+        * ``entropy_ball``: the entropy-gradient norm ``s_i`` -> the same robust
+          single ball;
+        * ``entropy``: Top-K of ``s_i`` -> union of K balls of radius
+          ``roi_radius`` (legacy geometry, used by the visualisation and as the
+          ablation reference).
+
+        The robust single ball is: greedy NMS + mass stop on the ranking, the
+        coordinate-wise weighted median as centre and a weighted quantile of
+        the seed distances (+ margin) as radius
+        (``utils.roi_sampling.select_reliable_roi``).
+        """
+        from utils import roi_sampling as rs
+
+        # the entropy *gradient* is only needed by the entropy rankings: the
+        # 'field' ranking only needs the boxes of the same ranking pass, so the
+        # extra backward through the decoder is skipped (identical results).
+        need_grad = self.roi_selector != 'field'
+        ranking = self._selection_entropy_seed_score(
             points_xyz, seed_features_cn, text_feats, text_padding_mask,
-            positive_map, detected_feats=detected_feats, detected_mask=detected_mask)
+            positive_map, detected_feats=detected_feats, detected_mask=detected_mask,
+            need_grad=need_grad)
+        score = ranking['score']
 
-        num_seeds = points_xyz.size(1)
-        topk = int(min(self.roi_topk, num_seeds))
-        top_idx = torch.topk(score, k=topk, dim=1, largest=True, sorted=True).indices
-        centers = torch.gather(
-            points_xyz.detach(), 1, top_idx.unsqueeze(-1).expand(-1, -1, 3))
+        if self.roi_selector == 'entropy':
+            # ---- legacy geometry: Top-K seeds -> union of K balls ----------
+            topk = int(min(self.roi_topk, points_xyz.size(1)))
+            top_idx = torch.topk(score, k=topk, dim=1, largest=True,
+                                 sorted=True).indices
+            centers = torch.gather(
+                points_xyz.detach(), 1, top_idx.unsqueeze(-1).expand(-1, -1, 3))
+            roi = sample_roi_points_torch(
+                cloud_xyz.detach().float(), centers.float(),
+                num_samples=self.roi_num_points, radius=self.roi_radius,
+                max_radius=self.roi_max_radius)
+            roi = dict(roi)
+            roi['top_seed_indices'] = top_idx
+            roi['score'] = score
+            roi['reliability'] = None
+            roi['field_rank'] = None
+            roi['centers'] = centers.float()
+            roi['radii'] = roi['radius_used'].float()
+        else:
+            # ---- reliability ranking -> robust single ball ------------------
+            if self.roi_selector == 'entropy_ball':
+                reliability = rs.rank_normalize(score)
+                field_rank = None
+            else:
+                field_rank = rs.proposal_seed_field(
+                    points_xyz.detach(), ranking['pred_center'],
+                    ranking['pred_size'], ranking['sel_prob'],
+                    top_m=self.roi_topm)
+                r_field = rs.rank_normalize(field_rank)
+                reliability = r_field
+                if self.roi_selector != 'field':
+                    # fuse the region prior with the entropy-gradient ranking
+                    r_grad = rs.rank_normalize(score)
+                    if self.roi_selector == 'fuse_mul':
+                        reliability = r_field * r_grad
+                    elif self.roi_selector == 'fuse_min':
+                        reliability = torch.minimum(r_field, r_grad)
+                    elif self.roi_selector == 'fuse_gate':
+                        a = float(self.roi_fuse_alpha)
+                        reliability = r_field * (1.0 + a * r_grad) / (1.0 + a)
+                    else:
+                        raise ValueError(
+                            f'unknown roi_selector {self.roi_selector!r}')
 
-        roi = sample_roi_points_torch(
-            cloud_xyz.detach().float(), centers.float(),
-            num_samples=self.roi_num_points, radius=self.roi_radius,
-            expand_factor=self.roi_expand_factor, max_radius=self.roi_max_radius)
+            geo = rs.select_reliable_roi(
+                points_xyz.detach(), reliability,
+                k_max=self.roi_topk, k_min=self.roi_k_min,
+                nms_radius=self.roi_nms_radius, mass_frac=self.roi_mass_frac,
+                score_ratio=self.roi_score_ratio, radius_q=self.roi_radius_q,
+                radius_margin=self.roi_radius_margin,
+                radius_min=self.roi_radius_min, radius_max=self.roi_radius_max)
+            roi = sample_roi_points_torch(
+                cloud_xyz.detach().float(), geo['centers'],
+                num_samples=self.roi_num_points, radius=geo['radii'],
+                max_radius=self.roi_max_radius)
+            roi = dict(roi)
+            roi['top_seed_indices'] = geo['sel_idx']
+            roi['score'] = score
+            roi['reliability'] = reliability
+            roi['field_rank'] = field_rank
+            roi['centers'] = geo['centers'].float()
+            roi['radii'] = geo['radii'].float()
 
-        roi = dict(roi)
-        roi['top_seed_indices'] = top_idx
-        roi['score'] = score
         if roi['points'].shape[1] != self.roi_num_points:
             raise RuntimeError(
                 f'ROI sampling produced {roi["points"].shape[1]} points, '
                 f'expected {self.roi_num_points}')
         return roi
-
-    def _log_roi(self, end_points, roi):
-        """Light-weight diagnostic log (rank 0, every ``roi_log_interval`` calls)."""
-        self._roi_calls += 1
-        cand = roi['num_candidates'].detach().float()
-        radius = roi['radius_used'].detach().float()
-        padded = roi['padded'].detach().float()
-        if self.roi_log_interval > 0 and (self._roi_calls % self.roi_log_interval == 0):
-            rank = 0
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                rank = torch.distributed.get_rank()
-            if rank == 0:
-                print(f'[roi] calls={self._roi_calls} '
-                      f'candidates={cand.mean().item():.0f} '
-                      f'radius={radius.mean().item():.3f} '
-                      f'padded={padded.mean().item():.3f} '
-                      f'num_vis_tokens={end_points["num_vis_tokens"]}')
 
     # BRIEF forward.
     def forward(self, inputs):
@@ -593,9 +760,9 @@ class PVGround(nn.Module):
                     f'ROI/seed feature dim mismatch: {roi_feats.size(-1)} vs '
                     f'{seed_features.size(1)}')
             roi_feats = roi_feats.detach() + self.roi_type_embedding   # (B, 512, 288)
-            
+
             points_xyz = torch.cat([points_xyz, roi_xyz], dim=1).contiguous()
-            seed_features = torch.cat([seed_feats_raw, roi_feats], dim=1)   # (B, 1536, 288)
+            seed_features = torch.cat([seed_feats_raw, roi_feats], dim=1)  # (B, 1024 + S, 288)
 
             seed_features, text_feats = self._encode_vision(
                 points_xyz, seed_features, text_feats_raw, text_padding_mask,
@@ -615,10 +782,17 @@ class PVGround(nn.Module):
             # ``roi['score']`` is exactly the entropy-gradient score
             # ``s_i = ||dH_sel/dF_i||_2`` produced by
             # ``_selection_entropy_seed_score`` and used by ``torch.topk``.
-            end_points['roi_entropy_scores'] = roi['score'].detach().float()
+            if roi['score'] is not None:
+                end_points['roi_entropy_scores'] = roi['score'].detach().float()
             end_points['roi_padded'] = roi['padded'].detach()
+            # debug-only: the ROI geometry (ball centres / radii) actually used
+            end_points['roi_centers'] = roi['centers'].detach().float()
+            end_points['roi_radii'] = roi['radii'].detach().float()
+            if roi['reliability'] is not None:
+                end_points['roi_reliability'] = roi['reliability'].detach().float()
+            if roi['field_rank'] is not None:
+                end_points['roi_field_rank'] = roi['field_rank'].detach().float()
             end_points['num_vis_tokens'] = int(points_xyz.size(1))
-            self._log_roi(end_points, roi)
         else:
             end_points['num_vis_tokens'] = int(points_xyz.size(1))
 

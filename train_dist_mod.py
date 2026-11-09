@@ -19,7 +19,7 @@ import random
 
 from main_utils import parse_option, BaseTrainTester
 from data.model_util_scannet import ScannetDatasetConfig
-from models import PVGround, apply_lora, mark_only_lora_trainable
+from models import PVGround
 from datasets.joint_det_dataset import Joint3DDataset
 from evaluation.grounding_evaluator import GroundingEvaluator
 from evaluation import APCalculator, parse_predictions, parse_groundtruths
@@ -116,9 +116,18 @@ class TrainTester(BaseTrainTester):
                 'topk': args.roi_topk,
                 'radius': args.roi_radius,
                 'max_radius': args.roi_max_radius,
-                'expand_factor': args.roi_expand_factor,
                 'tau': args.roi_tau,
-                'log_interval': args.roi_log_interval,
+                'selector': args.roi_selector,
+                'k_min': args.roi_k_min,
+                'nms_radius': args.roi_nms_radius,
+                'mass_frac': args.roi_mass_frac,
+                'score_ratio': args.roi_score_ratio,
+                'radius_q': args.roi_radius_q,
+                'radius_margin': args.roi_radius_margin,
+                'radius_min': args.roi_radius_min,
+                'radius_max': args.roi_radius_max,
+                'topm': args.roi_topm,
+                'fuse_alpha': args.roi_fuse_alpha,
             }
 
         ModelClass = eval(args.model)
@@ -139,14 +148,6 @@ class TrainTester(BaseTrainTester):
         )
         params = sum(p.numel() for p in model.parameters()) / 1e6
         print(f'Total parameters: {params:.2f}M')
-
-        # LoRA fine-tuning: freeze the pretrained model, adapt only LoRA params
-        if getattr(args, 'lora', False):
-            apply_lora(model, r=args.lora_rank, alpha=args.lora_alpha,
-                       dropout=args.lora_dropout)
-            n_train, n_total = mark_only_lora_trainable(model)
-            print(f'[lora] trainable {n_train / 1e6:.3f}M / '
-                  f'{n_total / 1e6:.2f}M parameters')
         return model
 
     # BRIEF input data.

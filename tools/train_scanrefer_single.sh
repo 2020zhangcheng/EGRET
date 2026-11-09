@@ -21,13 +21,13 @@ TORCH_DISTRIBUTED_DEBUG=INFO CUDA_VISIBLE_DEVICES=0,1 python -m torch.distribute
     --checkpoint_path ./data/PV-Ground_ScanRefer_single.pth \
 
 
-# LoRA fine-tuning with entropy-gradient guided ROI fusion (appended args win,
-# so they override the defaults above; effective batch = NGPU * batch_size * accum_steps):
+# ROI variants (appended args win, so they override the defaults above;
+# effective batch = NGPU * batch_size * accum_steps):
 #   CUDA_VISIBLE_DEVICES=0,1,2 NGPU=3 \
 #   EXTRA_ARGS="--max_epoch 10 --val_freq 2 --save_freq 2 --batch_size 8 --accum_steps 1 \
-#               --lr 1e-4 --lr-scheduler cosine --lora --roi \
-#               --checkpoint_path ./data/PV-Ground_ScanRefer_single.pth \
+#               --lr 1e-4 --lr_scheduler cosine --roi --roi_selector field \
+#               --roi_points 256 --roi_radius_max 2.0 \
+#               --checkpoint_path ./data/PV-Ground_ScanRefer_single.pth" \
 #   bash tools/train_scanrefer_single.sh
-# Resume from epoch 5 (LoRA-only checkpoint + frozen base):
-#   EXTRA_ARGS="... --resume --checkpoint_path ./logs/scanrefer/<exp>/<ts>/ckpt_epoch_4.pth \
-#               --init_checkpoint ./data/PV-Ground_ScanRefer_single.pth"
+# Resume from the last checkpoint:
+#   EXTRA_ARGS="... --resume --checkpoint_path ./logs/scanrefer/<exp>/<ts>/ckpt_epoch_4.pth"

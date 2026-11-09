@@ -20,11 +20,36 @@ Design (kept independent from the model, no GT box involved):
 
 The seed centres are the *real* Top-32 FPS seeds of the sample, never
 re-sampled, and the GT box is not used anywhere in this module.
+
+--------------------------------------------------------------------------
+Second part of the module: *reliable* seed selection (see the section
+"Seed reliability estimation" near the bottom).
+--------------------------------------------------------------------------
+Two rankings are supported:
+
+* ``entropy``  -- the legacy one: the Top-K of the entropy-gradient norm
+  ``s_i = ||dH_sel/dF_i||``, each seed defining a ball of radius
+  ``--roi_radius``; the ROI is the union of those balls (kept for the
+  visualisation and as the ablation reference);
+* ``entropy_ball`` / ``field`` -- the recommended one: one **robust ball**
+  around the weighted median of the seeds whose reliability score is the
+  largest.  The score is either ``rank(s_i)`` (``entropy_ball``) or the
+  box-proposal field ``rank(f_i)`` (``field``), where
+
+      f_i = sum_m w_m * exp(-0.5 * ||(x_i - c_m) / (delta_m / 2)||^2)
+
+  soft-contains the model's own predicted boxes (``proposal_seed_field``).
+  ``f_i`` is the *region level* prior that the seed-level signals do not have:
+  on ScanRefer val the entropy Top-32 ROI covers 34 % of the GT+1 m region,
+  the box field 54 % (GT oracle 81 %).
+
+The ROI geometry is: greedy NMS + mass stop -> coordinate-wise **weighted
+median** centre (breakdown point 50 %, a single outlier seed cannot drag it)
+-> weighted ``q``-quantile radius + margin -> one ball -> FPS.  A single ball
+(not the union of K balls) merges the reliable seeds of different object parts
+into one region.
 """
 
-from typing import Dict, Optional
-
-import numpy as np
 import torch
 
 try:  # scipy is already a dependency of the project (utils/box_util.py)
@@ -33,132 +58,24 @@ except Exception:  # pragma: no cover
     cKDTree = None
 
 
-def _chunks(n, size):
-    for start in range(0, n, size):
-        yield start, min(start + size, n)
-
-
-def roi_mask_from_centers(points_xyz, centers, radius, point_chunk=200_000):
-    """Boolean mask of the points inside the union of ``K`` spheres.
-
-    Args:
-        points_xyz: ``(N, 3)`` float array (original point cloud coordinates).
-        centers: ``(K, 3)`` float array (Top-K seed coordinates).
-        radius: sphere radius in metres.
-
-    Returns:
-        ``(N,)`` bool array.
-    """
-    points_xyz = np.asarray(points_xyz, dtype=np.float64)
-    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
-    if centers.shape[0] == 0:
-        return np.zeros(points_xyz.shape[0], dtype=bool)
-
-    if cKDTree is not None:
-        tree = cKDTree(points_xyz)
-        hits = tree.query_ball_point(centers, r=float(radius))
-        mask = np.zeros(points_xyz.shape[0], dtype=bool)
-        for idx in hits:
-            if len(idx):
-                mask[np.asarray(idx, dtype=np.int64)] = True
-        return mask
-
-    # brute force fallback (chunked, avoids huge intermediates)
-    mask = np.zeros(points_xyz.shape[0], dtype=bool)
-    r2 = float(radius) ** 2
-    for start, end in _chunks(points_xyz.shape[0], point_chunk):
-        diff = points_xyz[start:end, None, :] - centers[None, :, :]
-        d2 = np.einsum('nkd,nkd->nk', diff, diff)
-        mask[start:end] = (d2 <= r2).any(axis=1)
-    return mask
-
-
-def sample_roi_points(points_xyz, centers, num_samples=512, radius=0.3,
-                      seed=0, expand_factor=1.5, max_radius=2.0,
-                      pad_with_replacement=True) -> Dict[str, object]:
-    """Sample ``num_samples`` original points from the union of the seed balls.
-
-    Args:
-        points_xyz: ``(N, 3)`` original point cloud (never modified).
-        centers: ``(K, 3)`` Top-K entropy-gradient seed coordinates.
-        num_samples: number of points to return (512).
-        radius: initial radius in metres (0.3).
-        seed: RNG seed for the subsampling (reproducibility).
-        expand_factor: radius multiplier used when too few points are inside.
-        max_radius: stop growing the radius above this value.
-        pad_with_replacement: if even ``max_radius`` is not enough, pad the
-            sample with replacement instead of raising.
-
-    Returns:
-        dict with keys
-            ``indices``       (S,) int64, original point indices (unique unless
-                              ``padded``)
-            ``points``        (S, 3) float32, the sampled coordinates
-            ``radius_used``   float
-            ``num_candidates`` int, size of the candidate pool after the last
-                              radius increase
-            ``num_expansions`` int
-            ``padded``        bool
-            ``mask``          (N,) bool, the ROI mask at ``radius_used``
-    """
-    points_xyz = np.asarray(points_xyz, dtype=np.float64)
-    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
-    if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
-        raise ValueError(f'points_xyz must be (N, 3), got {points_xyz.shape}')
-    if centers.shape[0] == 0:
-        raise ValueError('centers is empty: cannot build any ROI')
-    if num_samples <= 0:
-        raise ValueError('num_samples must be positive')
-
-    rng = np.random.default_rng(int(seed))
-
-    radius_used = float(radius)
-    num_expansions = 0
-    mask = roi_mask_from_centers(points_xyz, centers, radius_used)
-    num_candidates = int(mask.sum())
-
-    while num_candidates < num_samples and radius_used < float(max_radius):
-        radius_used = min(radius_used * float(expand_factor), float(max_radius))
-        num_expansions += 1
-        mask = roi_mask_from_centers(points_xyz, centers, radius_used)
-        num_candidates = int(mask.sum())
-
-    candidates = np.flatnonzero(mask)
-    padded = False
-    if num_candidates == 0:
-        # Degenerate case (should not happen with a 50k cloud): fall back to the
-        # points closest to the seed centres.
-        d2 = ((points_xyz[:, None, :] - centers[None]) ** 2).sum(-1).min(1)
-        candidates = np.argsort(d2, kind='stable')[:num_samples]
-        padded = num_candidates == 0
-    if num_candidates < num_samples:
-        if not pad_with_replacement:
-            raise RuntimeError(
-                f'only {num_candidates} points inside the ROI (r={radius_used:.2f} m)')
-        chosen = rng.choice(candidates, size=num_samples, replace=True)
-        padded = True
-    else:
-        chosen = rng.choice(candidates, size=num_samples, replace=False)
-
-    chosen = np.sort(chosen.astype(np.int64))
-    return {
-        'indices': chosen,
-        'points': points_xyz[chosen].astype(np.float32),
-        'radius_used': float(radius_used),
-        'num_candidates': int(num_candidates),
-        'num_expansions': int(num_expansions),
-        'padded': bool(padded),
-        'mask': mask,
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Torch / GPU version used inside the network (differentiable-free, batched)
-# --------------------------------------------------------------------------- #
 def _union_mask_torch(points_xyz, centers, radius):
-    """``(B, N)`` bool mask of the points inside the union of ``K`` spheres."""
-    d2 = torch.cdist(points_xyz.float(), centers.float())        # (B, N, K)
-    return d2.min(dim=-1).values <= (float(radius) + 1e-4)
+    """``(B, N)`` bool mask of the points inside the union of ``K`` spheres.
+
+    ``radius`` is either a python float (same radius for every mode) or a
+    ``(B,)`` / ``(B, K)`` tensor: per-sample / per-centre radii, which is what
+    the adaptive (reliability driven) ROI needs.
+    """
+    dist = torch.cdist(points_xyz.float(), centers.float())       # (B, N, K)
+    if torch.is_tensor(radius):
+        r = radius.float().to(dist.device)
+        if r.dim() == 1:                                          # (B,) -> (B, 1, 1)
+            return dist.min(dim=-1).values <= (r.view(-1, 1) + 1e-4)
+        if r.dim() == 2:                                          # (B, K)
+            return (dist <= (r.unsqueeze(1) + 1e-4)).any(dim=-1)
+        if r.dim() == 3:                                          # (B, 1, K)
+            return (dist <= (r + 1e-4)).any(dim=-1)
+        raise ValueError(f'unsupported radius shape {tuple(r.shape)}')
+    return dist.min(dim=-1).values <= (float(radius) + 1e-4)
 
 
 def _fps_torch_single(xyz, npoint):
@@ -212,7 +129,7 @@ def _fps_batched(cand_xyz, batch_cnt, npoint):
 
 def sample_roi_points_torch(points_xyz, centers, num_samples=512, radius=0.3,
                             expand_factor=1.5, max_radius=2.0):
-    """Batched GPU version of :func:`sample_roi_points` using **FPS**.
+    """Batched GPU version of the ROI sampling (**FPS**, exactly 512 points).
 
     Semantics (identical to the numpy version, only the sub-sampling differs):
     the ROI is the *union* of the ``K`` balls ``B(c_k, r)`` so an overlapping
@@ -226,7 +143,9 @@ def sample_roi_points_torch(points_xyz, centers, num_samples=512, radius=0.3,
         points_xyz: ``(B, N, 3)`` original cloud (same device as ``centers``).
         centers: ``(B, K, 3)`` Top-K seed coordinates.
         num_samples: points to return per sample (512).
-        radius, expand_factor, max_radius: see :func:`sample_roi_points`.
+        radius: float or ``(B,)`` tensor (per-sample adaptive radius).
+        expand_factor / max_radius: geometric growth when a ROI holds
+            fewer than ``num_samples`` points.
 
     Returns:
         dict with ``indices`` ``(B, S)`` long (indices into the original cloud,
@@ -253,17 +172,29 @@ def sample_roi_points_torch(points_xyz, centers, num_samples=512, radius=0.3,
     dtype = points_xyz.dtype
 
     # ---- radius growth until enough candidates are available --------------
-    r = float(radius)
+    # ``radius`` is either a float (same ball for every sample) or a ``(B,)``
+    # tensor (per-sample adaptive radius of the robust single ball).
+    r = torch.as_tensor(radius, dtype=torch.float32, device=device).reshape(-1)
+    if r.numel() == 1:
+        r = r.expand(batch_size).clone()
+    if r.numel() != batch_size:
+        raise ValueError(f'{r.numel()} radii cannot be broadcast to a batch of '
+                         f'{batch_size}')
+    r_max = torch.as_tensor(max_radius, dtype=torch.float32,
+                            device=device).reshape(-1)
+    if r_max.numel() == 1:
+        r_max = r_max.expand(batch_size).clone()
+    r_max = torch.maximum(r_max, r)
     mask = _union_mask_torch(points_xyz, centers, r)
     counts = mask.sum(-1)
     num_expansions = 0
-    r_max = float(max(max_radius, radius))
-    while (not bool((counts >= num_samples).all())) and r < r_max - 1e-9:
-        r = min(r * float(expand_factor), r_max)
+    while (not bool((counts >= num_samples).all())) and \
+            bool((r < r_max - 1e-9).any()) and num_expansions < 32:
+        r = torch.minimum(r * float(expand_factor), r_max)
         num_expansions += 1
         mask = _union_mask_torch(points_xyz, centers, r)
         counts = mask.sum(-1)
-    radius_used = torch.full((batch_size,), r, dtype=dtype, device=device)
+    radius_used = r.to(dtype)
 
     # ---- degenerate case: no candidate at all -> nearest cloud point ------
     empty = counts < 1
@@ -313,4 +244,187 @@ def sample_roi_points_torch(points_xyz, centers, num_samples=512, radius=0.3,
         'num_expansions': int(num_expansions),
         'padded': padded,
         'mask': mask,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Seed reliability estimation
+# --------------------------------------------------------------------------- #
+#: Available ROI rankings.  ``entropy`` is the legacy multi-ball geometry (kept
+#: for the visualisation / ablation), ``entropy_ball`` uses only the
+#: entropy-gradient norm and ``field`` the box-proposal field; the latter two
+#: share the robust single-ball geometry.
+SELECTORS = ('entropy', 'entropy_ball', 'field')
+
+
+def rank_normalize(x):
+    """Empirical CDF of ``x`` along the last dim -> ``(0, 1]``.
+
+    Every per-sample score enters the fusion through this transform: the raw
+    ``||dH/dF||`` (and the mask logits) have a heavy, *scene dependent* tail,
+    so a fixed Top-K / threshold on the raw value means a different thing on
+    every scene.  The ECDF is scale free, keeps the ranking, and gives the
+    fusion bounded factors that can be multiplied without weight tuning.
+    """
+    n = int(x.shape[-1])
+    order = torch.argsort(x.float(), dim=-1)
+    ranks = torch.empty_like(order)
+    ranks.scatter_(-1, order, torch.arange(n, device=x.device).expand_as(order))
+    return (ranks.to(torch.float32) + 0.5) / float(n)
+
+
+# --------------------------------------------------------------------------- #
+# Reliable ROI: weighted median centre + adaptive radius (single ball)
+# --------------------------------------------------------------------------- #
+def proposal_seed_field(xyz, centers, sizes, probs, top_m=8, eps=1e-3):
+    """Soft-containment field of the model's own box predictions ``(B, N)``.
+
+    The 1024 seeds are *not* a good localization prior (see the diagnostics),
+    while the decoder already regresses ``Q = 256`` boxes and ranks them by
+    ``P(q|m)``.  This function turns the ``M`` best text-matched boxes into a
+    continuous, non-committal field over the seeds:
+
+        kappa_im = exp(-1/2 * sum_a ((x_i,a - c_m,a) / (s_m,a / 2))^2)
+        field_i  = sum_m  w_m * kappa_im / sum_m w_m ,   w_m = P(q_m | m)
+
+    i.e. a Gaussian mixture whose components are the predicted boxes
+    (Mahalanobis distance in *box units*, so a large object has a large
+    support).  Taking ``M > 1`` weighted hypotheses -- instead of the single
+    arg-max box -- is the reliability gate of this term: it is the EATA/SAR
+    "do not trust one high-variance sample" idea applied to box hypotheses.
+
+    Args:
+        xyz: ``(B, N, 3)`` seed coordinates.
+        centers: ``(B, Q, 3)`` predicted box centres (``last_center``).
+        sizes: ``(B, Q, 3)`` predicted box sizes (``last_pred_size``).
+        probs: ``(B, Q)`` query selection probability ``P(q|m)``.
+        top_m: number of box hypotheses kept.
+
+    Returns:
+        ``(B, N)`` float32 in ``(0, 1]``.
+    """
+    B, N, _ = xyz.shape
+    Q = probs.size(1)
+    m = int(min(max(top_m, 1), Q))
+    w, top_idx = probs.float().topk(m, dim=1)                     # (B, M)
+    w = w / w.sum(-1, keepdim=True).clamp_min(1e-8)
+    gather = top_idx.unsqueeze(-1).expand(-1, -1, 3)
+    c = torch.gather(centers.float(), 1, gather)                  # (B, M, 3)
+    s = torch.gather(sizes.float(), 1, gather).abs()
+    half = (s * 0.5).clamp_min(eps)                               # (B, M, 3)
+    diff = (xyz.float().unsqueeze(2) - c.unsqueeze(1)) / half.unsqueeze(1)
+    q = (diff ** 2).sum(-1)                                       # (B, N, M)
+    kappa = torch.exp(-0.5 * q)
+    return (kappa * w.unsqueeze(1)).sum(-1)                       # (B, N)
+
+
+def _weighted_quantile(values, weights, q):
+    """Per-row weighted ``q``-quantile along the last dim -> ``(B,)``."""
+    v, idx = torch.sort(values.float(), dim=-1)
+    w = torch.gather(weights.float(), -1, idx)
+    cw = torch.cumsum(w, dim=-1)
+    cw = cw / cw[..., -1:].clamp_min(1e-8)
+    pos = (cw >= float(q)).float().argmax(dim=-1)
+    return torch.gather(v, -1, pos.unsqueeze(-1)).squeeze(-1)
+
+
+def weighted_median(xyz, weight):
+    """Coordinate-wise weighted median of ``(B, K, 3)`` points -> ``(B, 3)``.
+
+    The median (breakdown point 50%) is what makes the ROI centre immune to a
+    single wrong seed: moving one of the ``K`` selected seeds to a distractor
+    cannot move the centre outside the support of the remaining ones, whereas
+    the mean would be dragged by it.
+    """
+    return torch.stack([
+        _weighted_quantile(xyz[..., a], weight, 0.5) for a in range(3)
+    ], dim=-1)
+
+
+def select_reliable_roi(xyz, score, k_max=32, k_min=4, nms_radius=0.5,
+                        mass_frac=0.9, score_ratio=0.3, radius_q=0.9,
+                        radius_margin=0.35, radius_min=0.4, radius_max=1.6):
+    """Reliable seeds -> one ROI centre per sample + an adaptive radius.
+
+    1. **Greedy NMS**: seeds are visited by decreasing ``R`` and accepted only
+       if they are at least ``nms_radius`` away from every accepted seed, so
+       the set ``S`` covers the reliable *region* instead of 32 copies of the
+       same spot.
+    2. **Adaptive stop**: stop at ``k_max``, or once ``|S| >= k_min`` and the
+       accepted mass reaches ``mass_frac`` of the total mass, or when the next
+       score falls below ``score_ratio * max R`` (EATA-style relative
+       threshold: no absolute value is assumed, the threshold is defined by the
+       sample's own distribution).
+    3. **Robust centre**: coordinate-wise weighted median of ``S``.
+    4. **Adaptive radius**: weighted ``radius_q`` quantile of
+       ``||x_j - c||`` over ``S`` plus ``radius_margin``, clipped to
+       ``[radius_min, radius_max]`` -- the extent of the *reliable seed set*
+       (it saturates at ``radius_max`` whenever the score field is diffuse).
+
+    Returns:
+        dict with ``centers`` ``(B, 1, 3)``, ``radii`` ``(B,)``, ``sel_idx``
+        ``(B, k_max)`` (``-1`` = padding), ``sel_w`` ``(B, k_max)``,
+        ``num_sel`` ``(B,)``.
+    """
+    if xyz.dim() != 3 or xyz.shape[-1] != 3:
+        raise ValueError(f'xyz must be (B, N, 3), got {tuple(xyz.shape)}')
+    B, N, _ = xyz.shape
+    k_max = int(min(k_max, N))
+    xyz = xyz.float()
+    score = score.float()
+
+    centers = xyz.new_zeros(B, 3)
+    radii = xyz.new_zeros(B)
+    sel_idx = torch.full((B, k_max), -1, dtype=torch.long, device=xyz.device)
+    sel_w = xyz.new_zeros(B, k_max)
+    num_sel = torch.zeros(B, dtype=torch.long, device=xyz.device)
+
+    for b in range(B):
+        s = score[b].detach()
+        order = torch.argsort(s, descending=True)
+        s_max = float(s[order[0]])
+        total = float(s.sum().clamp_min(1e-8))
+        accepted, mass = [], 0.0
+        for j in order.tolist():
+            if len(accepted) >= k_max:
+                break
+            sj = float(s[j])
+            if sj <= 0.0:
+                break
+            if len(accepted) >= k_min and sj < score_ratio * s_max:
+                break
+            if accepted:
+                d = (xyz[b, accepted] - xyz[b, j]).norm(dim=-1).min()
+                if float(d) <= nms_radius:
+                    continue
+            accepted.append(j)
+            mass += sj
+            if len(accepted) >= k_min and mass / total >= mass_frac:
+                break
+        if not accepted:
+            accepted = [int(order[0])]
+
+        idx = torch.as_tensor(accepted, dtype=torch.long, device=xyz.device)
+        w = s[idx].clamp_min(1e-8)
+        pts = xyz[b][idx]                                       # (K, 3)
+        center = weighted_median(pts.unsqueeze(0), w.unsqueeze(0))[0]
+
+        d = (pts - center).norm(dim=-1)
+        r = float(_weighted_quantile(d.unsqueeze(0), w.unsqueeze(0), radius_q))
+        r = min(max(r + float(radius_margin), float(radius_min)),
+                float(radius_max))
+
+        k = len(accepted)
+        centers[b] = center
+        radii[b] = r
+        sel_idx[b, :k] = idx
+        sel_w[b, :k] = w
+        num_sel[b] = k
+
+    return {
+        'centers': centers.unsqueeze(1),          # (B, 1, 3) -> one ball
+        'radii': radii,                           # (B,)
+        'sel_idx': sel_idx,
+        'sel_w': sel_w,
+        'num_sel': num_sel,
     }
