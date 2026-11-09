@@ -1,10 +1,10 @@
-# PV-Ground + Entropy-Gradient ROI Sampling
+# EGRET: Evidence Retrieval for Training-Free 3D Visual Grounding via Entropy Gradients
 
 3D visual grounding on ScanRefer: given a 50k-point indoor cloud and a natural
 language description, predict the 3D bounding box of the referred object.
 
 On top of [PV-Ground](https://github.com/AaNnWwTt/PV-Ground) this repository adds
-a **training-free ROI re-sampling branch**: besides the 1024 FPS seeds, a small
+a **training-free evidence retrieval**: besides the 1024 FPS keypoints, a small
 region of interest is selected with
 
 $$
@@ -12,10 +12,10 @@ R_i=\mathrm{rank}(f_i)\cdot\mathrm{rank}(s_i)\cdot\widehat{\mathrm{cons}}_i,
 \qquad s_i=\Big\|\frac{\partial H_{sel}}{\partial F_i}\Big\|_2
 $$
 
-($s_i$: entropy-gradient score of seed $i$; $f_i$: box-proposal field built from
+($s_i$: entropy-gradient score of keypoint $i$; $f_i$: box-proposal field built from
 the model's own predicted boxes; $\mathrm{cons}_i$: kNN spatial consensus), and
 256 extra points are FPS-sampled from one robust ball around the
-weighted-median centre of the reliable seeds.  The seeds become 1024 → 1280
+weighted-median centre of the reliable keypoints.  The keypoints become 1024 → 1280
 tokens; **no module is trained, no parameter is updated, no extra loss is used,
 and no ground truth is involved at inference**.
 
@@ -32,7 +32,6 @@ pip install numpy scipy plyfile open3d matplotlib tqdm easydict pyyaml \
             transformers==4.44.2 tokenizers ipdb
 
 # CUDA operators
-source setup_cuda_paths.sh
 cd pointnet2   && python setup.py install && cd ..
 cd segmentator && python setup.py install && cd ..
 ```
@@ -48,13 +47,13 @@ cd segmentator && python setup.py install && cd ..
 
 ## 3. Inference
 
-**Baseline (1024 seeds)**
+**Baseline (1024 keypoints)**
 
 ```bash
 bash tools/test_scanrefer_single.sh
 ```
 
-**Entropy-gradient ROI sampling (best configuration)**
+**Entropy-gradient ROI sampling**
 
 ```bash
 EXTRA_ARGS="--roi --roi_selector field --roi_points 256 --roi_radius_max 2.0" \
@@ -68,8 +67,8 @@ ScanRefer `val`, 9508 expressions, released checkpoint, metric = `mask@kiou`
 
 | method | Acc@0.25 | Acc@0.50 |
 |---|---|---|
-| baseline (1024 seeds) | 0.6187 | 0.5448 |
-| **+ entropy-gradient ROI (256 extra points)** | **0.6231** | **0.5583** |
+| baseline (1024 keypoints) | 0.5829 | 0.4722 |
+| **+ Ours (256 extra points)** | **0.6023** | **0.5011** |
 
 ## 5. Visualisation
 
